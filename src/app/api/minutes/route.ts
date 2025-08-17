@@ -1,8 +1,8 @@
 import { NextRequest } from "next/server";
 import OpenAI from "openai";
-import { toFile } from "openai/uploads";
 import mammoth from "mammoth";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -10,12 +10,25 @@ export const dynamic = "force-dynamic";
 type MinutesResult = {
   transcript: string;
   summary: string;
+  minutes: string;
 };
 
 function getOpenAI() {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
   return new OpenAI({ apiKey });
+}
+
+function loadPrompt(): string {
+  try {
+    const promptPath = join(process.cwd(), "prompts", "meeting-minutes.txt");
+    const prompt = readFileSync(promptPath, "utf-8");
+    return prompt;
+  } catch (error) {
+    console.error("プロンプトファイルの読み込みエラー:", error);
+    // フォールバック用のデフォルトプロンプト
+    return "あなたは日本語の議事録作成アシスタントです。入力された文字起こしテキストから、要約と議事録本文を作成してください。";
+  }
 }
 
 async function readStyleFiles(styleFiles: File[]): Promise<string> {
@@ -44,20 +57,6 @@ async function readStyleFiles(styleFiles: File[]): Promise<string> {
   return chunks.join("\n\n");
 }
 
-async function readFromS3Key(key: string): Promise<Buffer | null> {
-  const region = process.env.AWS_REGION;
-  const bucket = process.env.AWS_S3_BUCKET;
-  const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
-  const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
-  if (!region || !bucket || !accessKeyId || !secretAccessKey) return null;
-  const s3 = new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
-  const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-  const stream = obj.Body as any as NodeJS.ReadableStream;
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  return Buffer.concat(chunks);
-}
-
 async function buildStyleGuidelines(openai: OpenAI | null, corpus: string): Promise<string> {
   if (!corpus || corpus.length < 200) return "";
   if (!openai) {
@@ -75,50 +74,21 @@ async function buildStyleGuidelines(openai: OpenAI | null, corpus: string): Prom
   return resp.choices[0]?.message?.content ?? "";
 }
 
-async function transcribeAll(openai: OpenAI | null, audioFiles: File[]): Promise<string> {
-  if (!audioFiles.length) return "";
-  if (!openai) {
-    // No API key -> return mock transcript
-    return "【モック転記】AIキー未設定のためダミーの議事録本文です。";
-  }
-  const pieces: string[] = [];
-  for (const f of audioFiles) {
-    const ofile = await toFile(Buffer.from(await f.arrayBuffer()), f.name, { type: f.type || "audio/mpeg" });
-    try {
-      const resp = await openai.audio.transcriptions.create({
-        file: ofile as any,
-        model: "gpt-4o-transcribe",
-        // fallback handled by API
-      });
-      pieces.push(resp.text || "");
-    } catch (e) {
-      // try whisper-1 as fallback
-      try {
-        const resp2 = await openai.audio.transcriptions.create({
-          file: ofile as any,
-          model: "whisper-1",
-        });
-        pieces.push(resp2.text || "");
-      } catch {
-        pieces.push("");
-      }
-    }
-  }
-  return pieces.filter(Boolean).join("\n\n");
-}
-
 async function summarize(openai: OpenAI | null, transcript: string, styleGuidelines: string): Promise<MinutesResult> {
   if (!openai) {
     // fallback mock
     return {
       transcript: transcript || "【モック転記】AIキー未設定のためダミー本文。",
       summary: "【モック要約】主要論点と次回アクションを整理しました。",
+      minutes: "【モック議事録】AIキー未設定のためダミー本文。",
     };
   }
 
+  // 外部プロンプトファイルを読み込み
+  const externalPrompt = loadPrompt();
+  
   const system = [
-    "あなたは日本語の議事録作成アシスタントです。",
-    "正確・簡潔・箇条書きを基本とし、見出しと段落を適切に整形します。",
+    externalPrompt,
     styleGuidelines ? `以下のスタイル指針に合わせて記述してください:\n${styleGuidelines}` : "",
   ]
     .filter(Boolean)
@@ -157,59 +127,80 @@ async function summarize(openai: OpenAI | null, transcript: string, styleGuideli
   const content = resp.choices[0]?.message?.content ?? "{}";
   try {
     const parsed = JSON.parse(content);
-    return { transcript, summary: parsed.summary ?? "", } as MinutesResult & { summary: string } & { transcript: string } & { minutes: string };
+    return { 
+      transcript: transcript, 
+      summary: parsed.summary ?? "",
+      minutes: parsed.minutes ?? ""  // 議事録本文を追加
+    };
   } catch {
-    return { transcript, summary: "要約の解析に失敗しました。", } as MinutesResult;
+    return { 
+      transcript: transcript, 
+      summary: "要約の解析に失敗しました。",
+      minutes: "議事録本文の解析に失敗しました。"
+    };
   }
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const contentType = req.headers.get("content-type") || "";
-    let audioFiles: File[] = [];
-    let styleFiles: File[] = [];
-    let s3AudioKeys: string[] = [];
+    console.log("=== /api/minutes 開始 ===");
+    
+    const form = await req.formData();
+    const transcript = form.get("transcript") as string;
+    const styleFiles = form.getAll("style").filter((v): v is File => v instanceof File);
 
-    if (contentType.includes("multipart/form-data")) {
-      const form = await req.formData();
-      audioFiles = form.getAll("audio").filter((v): v is File => v instanceof File);
-      styleFiles = form.getAll("style").filter((v): v is File => v instanceof File);
-      s3AudioKeys = form.getAll("s3Key").filter((v): v is string => typeof v === "string") as string[];
-    } else if (contentType.includes("application/json")) {
-      const body = await req.json();
-      s3AudioKeys = (body?.s3Keys || []) as string[];
+    console.log("transcript length:", transcript?.length);
+    console.log("styleFiles count:", styleFiles.length);
+
+    if (!transcript || !transcript.trim()) {
+      console.log("エラー: 文字起こしテキストが不足");
+      return new Response(
+        JSON.stringify({ error: "文字起こしテキストが必要です" }),
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
     }
 
+    console.log("OpenAI 初期化開始");
     const openai = getOpenAI();
+    console.log("OpenAI 初期化完了:", !!openai);
 
-    let transcriptFromUploads = await transcribeAll(openai, audioFiles);
-
-    if (s3AudioKeys.length) {
-      for (const key of s3AudioKeys) {
-        const buf = await readFromS3Key(key);
-        if (!buf) continue;
-        const fakeFile = new File([buf], key.split("/").pop() || "audio.mp3", { type: "audio/mpeg" });
-        transcriptFromUploads += "\n\n" + (await transcribeAll(openai, [fakeFile]));
-      }
-    }
-
+    console.log("スタイルファイル読み込み開始");
     const styleCorpus = await readStyleFiles(styleFiles);
+    console.log("スタイルファイル読み込み完了, 長さ:", styleCorpus.length);
 
+    console.log("スタイルガイドライン生成開始");
     const styleGuidelines = await buildStyleGuidelines(openai, styleCorpus);
-    const result = await summarize(openai, transcript, styleGuidelines);
+    console.log("スタイルガイドライン生成完了, 長さ:", styleGuidelines.length);
 
+    console.log("議事録生成開始");
+    const result = await summarize(openai, transcript, styleGuidelines);
+    console.log("議事録生成完了");
+    console.log("要約長さ:", result.summary.length);
+    console.log("議事録本文長さ:", result.minutes.length);
+
+    console.log("=== /api/minutes 成功 ===");
     return new Response(
       JSON.stringify({
-        transcript: result.transcript || transcriptFromUploads,
+        transcript: result.transcript,
         summary: result.summary,
+        minutes: result.minutes, // 議事録本文を正しく返す
         styleGuidelines,
         usedAI: Boolean(openai),
       }),
       { status: 200, headers: { "content-type": "application/json" } }
     );
   } catch (e: any) {
+    console.error("=== /api/minutes エラー ===");
+    console.error("エラータイプ:", e.constructor.name);
+    console.error("エラーメッセージ:", e.message);
+    console.error("エラースタック:", e.stack);
+    console.error("エラー詳細:", e);
+    
     return new Response(
-      JSON.stringify({ error: e?.message || "Unknown error" }),
+      JSON.stringify({ 
+        error: e?.message || "Unknown error",
+        details: e?.stack || "No stack trace"
+      }),
       { status: 500, headers: { "content-type": "application/json" } }
     );
   }
